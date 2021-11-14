@@ -1,0 +1,70 @@
+#standardSQL
+-- MIT License
+-- Copyright (c) 2018 Evgeny Medvedev, evge.medvedev@gmail.com
+-- slightly modified to calculate supply and account for destroyed ETH by johannes.pfeffer@atpar.io
+-- Run at https://console.cloud.google.com/marketplace/product/ethereum/crypto-ethereum-blockchain?filter=solution-type:dataset&q=ethereum%20cryptocurrency
+
+-- Pads indexes in trace_address to 5 so trace addresses can be chronologically ordered
+CREATE TEMPORARY FUNCTION normalize_trace_address(trace_address STRING)
+    RETURNS STRING AS ((
+    SELECT ARRAY_TO_STRING(ARRAY_AGG(lpadded), ',') as arr
+    FROM
+    (
+      SELECT LPAD(addr, 5, '0') as lpadded
+      FROM UNNEST((
+        SELECT SPLIT(trace_address, ','))
+      ) AS addr
+    )
+));
+
+with double_entry_book as (
+    -- debits
+    select to_address as address, value as value, block_number as block_height
+    from `bigquery-public-data.crypto_ethereum.traces`
+    where to_address is not null
+    and block_number <= 9193265
+    and status = 1
+    and (call_type not in ('delegatecall', 'callcode', 'staticcall') or call_type is null)
+    union all
+    -- credits
+    select from_address as address, -value as value, block_number as block_height
+    from `bigquery-public-data.crypto_ethereum.traces`
+    where from_address is not null
+    and block_number <= 9193265
+    and status = 1
+    and (call_type not in ('delegatecall', 'callcode', 'staticcall') or call_type is null)
+    union all
+    -- destroyed ETH credits (self-destructs with self as target)
+    select from_address as address, -value as value, block_number as block_height
+    from `bigquery-public-data.crypto_ethereum.traces`
+    where from_address = to_address 
+    and block_number <= 9193265
+    and status = 1
+    and trace_type = 'suicide'
+    union all
+    -- destroyed ETH credits (value transfers to destroyed contract in same tx)
+    select traces2.from_address as address, -traces2.value as value, traces2.block_number as block_height
+    from `bigquery-public-data.crypto_ethereum.traces` as traces1
+    join `bigquery-public-data.crypto_ethereum.traces` as traces2 using(transaction_hash)
+    where traces1.trace_type = 'suicide'
+    and traces1.from_address = traces2.to_address
+    and traces1.to_address != traces2.from_address -- exclude contracts destroyed multiple times in 1 tx
+    and normalize_trace_address(traces2.trace_address) > normalize_trace_address(traces1.trace_address)
+    and traces2.block_number <= 10663796
+    and traces2.value > 0
+    and traces2.status = 1
+    union all
+    -- transaction fees debits
+    select miner as address, sum(cast(receipt_gas_used as numeric) * cast(gas_price as numeric)) as value, max(block_number) as block_height
+    from `bigquery-public-data.crypto_ethereum.transactions` as transactions
+    join `bigquery-public-data.crypto_ethereum.blocks` as blocks on blocks.number = transactions.block_number
+    where block_number <= 9193265
+    group by blocks.miner
+    union all
+    -- transaction fees credits
+    select from_address as address, -(cast(receipt_gas_used as numeric) * cast(gas_price as numeric)) as value, block_number as block_height
+    from `bigquery-public-data.crypto_ethereum.transactions`
+    where block_number <= 9193265
+)
+select sum(value) as ETH_supply, max(block_height) as block_height
+from double_entry_book
